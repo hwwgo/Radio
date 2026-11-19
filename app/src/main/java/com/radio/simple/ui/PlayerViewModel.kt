@@ -40,6 +40,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.ByteArrayOutputStream
+import java.util.Locale
 import kotlin.math.abs
 
 /**
@@ -95,6 +96,9 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
     /** 正在给哪个台测响度 */
     private var measureJob: Job? = null
 
+    /** 用户点了「重新测量所有电台」，队列跑完后要汇报结果 */
+    private var remeasureRequested = false
+
     /**
      * 新电台的预听队列。
      *
@@ -116,11 +120,24 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
             },
             enabled = { settingsStore.current.normalizeVolume },
             shouldSkip = { station ->
-                // 正在播的台交给播放链路去测，别重复拉流；已经有档案的不测
+                // 正在播的台交给播放链路去测，别重复拉流；已经有档案的不测。
+                // 手动重测时队列会绕过这个判断，用户要的是全部重来一遍
                 station.id == currentId || hasProfile(station.id)
+            },
+            onFinished = { progress ->
+                // 一批测完，中位数可能整体挪了：正在播的台再套一次
+                applyGainForCurrent()
+                if (remeasureRequested) {
+                    remeasureRequested = false
+                    message = remeasureSummary(progress)
+                }
             },
         )
     }
+
+    /** 设置页显示的测量进度（跟着队列走，重测时才有意义） */
+    val measureProgress: StateFlow<StationMeasureQueue.Progress>
+        get() = measureQueue.progress
 
 
     /** 最近一次请求播放的地址，出错时用来给一句有针对性的提示 */
@@ -533,7 +550,6 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
             delay(500)
             waited += 500
         }
-        if (!settingsStore.current.normalizeVolume) return null
         return LoudnessProbe(getApplication()).measure(station.url)
     }
 
@@ -562,6 +578,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
 
         if (!enabled) {
             // 关掉就立刻回到原始电平，别再让队列在后台偷偷拉流
+            remeasureRequested = false
             measureQueue.cancel()
             PlaybackEngine.gain()?.setGain(1f)
             return
@@ -577,6 +594,46 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
             }
         }
         measureQueue.enqueue(stations.value)
+    }
+
+    /**
+     * 设置页的「重新测量所有电台」。
+     *
+     * 已经有档案的也重测：直播节目换时段、换源之后响度会变，旧档案可能已经偏了。
+     * 测完写回档案，目标电平（中位数）跟着重算，正在播的台当场按新值对齐。
+     */
+    fun remeasureAll() {
+        val list = stations.value
+        if (list.isEmpty()) {
+            message = "还没有电台可以测量"
+            return
+        }
+        remeasureRequested = true
+        // 播放中的实时测量用的是旧目标，先停掉；重测结果会重新套上去
+        measureJob?.cancel()
+        measureJob = null
+        measureQueue.enqueue(list, force = true)
+    }
+
+    /** 设置页进度旁边的「停止」 */
+    fun cancelRemeasure() {
+        if (!remeasureRequested) return
+        remeasureRequested = false
+        measureQueue.cancel()
+        message = "已停止测量"
+    }
+
+    private fun remeasureSummary(progress: StationMeasureQueue.Progress): String {
+        val ok = progress.done - progress.failed
+        if (progress.done == 0) return "没能测到任何电台，检查一下网络或链接"
+
+        val head = if (progress.failed > 0) "已重测 $ok 个电台，${progress.failed} 个连不上" else "已重测 $ok 个电台"
+        val target = targetLufs()
+        return if (settingsStore.current.normalizeVolume && target != null) {
+            "$head，统一到 ${String.format(Locale.US, "%.1f", target)} LUFS"
+        } else {
+            "$head；打开「自动音量」后生效"
+        }
     }
 
     /** 拖拽排序松手后调用，按新顺序落盘 */

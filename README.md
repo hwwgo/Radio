@@ -8,12 +8,12 @@
 ![Kotlin](https://img.shields.io/badge/Kotlin-2.3.21-7F52FF?logo=kotlin&logoColor=white)
 ![Compose](https://img.shields.io/badge/Jetpack%20Compose-Material%203-4285F4?logo=jetpackcompose&logoColor=white)
 ![Media3](https://img.shields.io/badge/Media3-1.11.1-FF6F00)
-![Tests](https://img.shields.io/badge/Tests-115%20passed-success)
+![Tests](https://img.shields.io/badge/Tests-123%20passed-success)
 ![License](https://img.shields.io/badge/License-MIT-blue)
 
 | 主界面 | 设置 |
 | :---: | :---: |
-| <img src="docs/images/home.png" width="300" alt="主界面：电台列表与底部播放条"> | <img src="docs/images/settings-dark.png" width="300" alt="设置页：添加电台、缓冲时间、自动音量"> |
+| <img src="docs/images/home.png" width="300" alt="主界面：电台列表与底部播放条"> | <img src="docs/images/settings-dark.png" width="300" alt="设置页：添加电台、缓冲时间、自动音量、重新测量"> |
 
 ## 目录
 
@@ -56,6 +56,7 @@
 
 - **自动音量**：每个台存一份响度档案，按它调输出电平——响的压、轻的抬，切台不再忽大忽小（可关）
 - **新加 / 导入的电台入库后就在后台静音预听一遍**，第一次点它就已经是对齐的
+- **一键重测**：设置里可以把所有电台重新测一遍，按最新响度重算目标电平和每台的增益
 - 增益作用在 PCM 域，改的是送给系统的数据，和用户拖的音量条互不干扰
 
 **细节**
@@ -69,7 +70,7 @@
 
 **直接用**
 
-到 [Releases](../../releases) 下载最新的 `RadioApp-x.y-release.apk`（当前版本 **2.2**，versionCode 13），传到手机上安装。
+到 [Releases](../../releases) 下载最新的 `RadioApp-x.y-release.apk`（当前版本 **2.3**，versionCode 14），传到手机上安装。
 
 - 需要 Android 8.0（API 26）及以上
 - 首次播放会请求通知权限（Android 13+），用于通知栏 / 锁屏控制
@@ -351,6 +352,19 @@ ITU-R BS.1770 的积分响度，外加一个峰值：
 | 正在播、但档案不全的台 | 播放链路自己测，2.4 秒先粗对一版，10 秒出正式值 |
 | 老版本留下的半截档案 | 只压不抬，下次播放 / 预听时补齐峰值 |
 
+**重新测量所有电台**
+
+开关下面有一个「重新测量」按钮：把当前列表里的台**全部**重新静音预听一遍（包括已经有档案的、
+正在播的），测完按新的中位数重算目标电平和每台的增益，正在播的那个台当场按新值对齐。
+
+什么时候用它：听得久了觉得某几个台偏响 / 偏轻；换过时段的节目（深夜谈话和白天的响度不一样）；
+或者刚导入一批台想一次校准到位。
+
+- **串行**：还是排队一个个测，不会十几条流同时拉
+- **有进度**：按钮位置会变成「已测 3 / 18」+ 进度条 + 当前电台名，随时可以「停止」
+- **失败保留旧档案**：连不上的台不会把原来的读数清掉，只是这次不更新
+- **开关关着也能测**：测完不生效，打开开关后按新档案对齐
+
 **导入 M3U**
 
 通过系统文件选择器（`ACTION_OPEN_DOCUMENT`）选文件，所以**不需要任何存储权限**。
@@ -405,7 +419,7 @@ http://ngcdn001.cnr.cn/live/zgzs/index.m3u8
 ./gradlew testDebugUnitTest
 ```
 
-115 个单元测试，全部跑在 JVM 上（Robolectric + 真实音频样本），不需要真机：
+123 个单元测试，全部跑在 JVM 上（Robolectric + 真实音频样本），不需要真机：
 
 - `StationStoreTest`：链接规范化（自动补 `http://`、拒绝非法地址）、增删改查 + 落盘、重排（漏掉的 / 不认识的 id 都不能让电台丢失）
 - `M3uParserTest`：`#EXTINF` 名字解析（含带引号逗号、CRLF、BOM）、HLS 识别、去重 key、批量导入的「新增 / 重复 / 无效」计数 + 落盘

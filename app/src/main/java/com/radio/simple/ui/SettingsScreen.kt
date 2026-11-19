@@ -17,11 +17,13 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -33,6 +35,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.radio.simple.data.RadioSettings
+import com.radio.simple.playback.StationMeasureQueue
 import kotlin.math.roundToInt
 
 /**
@@ -44,9 +47,12 @@ fun SettingsPane(
     stationCount: Int,
     isImporting: Boolean,
     isExporting: Boolean,
+    measureProgress: StationMeasureQueue.Progress,
     onAddClick: () -> Unit,
     onBufferSecondsChange: (Int) -> Unit,
     onNormalizeVolumeChange: (Boolean) -> Unit,
+    onRemeasureClick: () -> Unit,
+    onCancelMeasure: () -> Unit,
     onImportClick: () -> Unit,
     onExportClick: () -> Unit,
     modifier: Modifier = Modifier,
@@ -188,6 +194,80 @@ fun SettingsPane(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+
+                HorizontalDivider(
+                    modifier = Modifier.padding(vertical = 18.dp),
+                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f),
+                )
+
+                Text(
+                    text = "重新测量所有电台",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    text = if (stationCount > 0) {
+                        "直播节目的响度会变（换时段、换源）。这里把 $stationCount 个台逐个" +
+                            "静音预听 10 秒重新建档，再按新的中位数重算增益和衰减，大约需要 " +
+                            "${estimateMinutes(stationCount)} 分钟，流量每个台约 160 KB。"
+                    } else {
+                        "加几个电台之后，可以在这里一次性重新测量。"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+
+                Spacer(Modifier.height(12.dp))
+
+                if (measureProgress.running) {
+                    Column(modifier = Modifier.testTag("settings_remeasure_progress")) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(18.dp),
+                                strokeWidth = 2.dp,
+                            )
+                            Spacer(Modifier.width(10.dp))
+                            Text(
+                                text = "已测 ${measureProgress.done} / ${measureProgress.total}",
+                                style = MaterialTheme.typography.bodyMedium,
+                                modifier = Modifier.weight(1f),
+                            )
+                            TextButton(
+                                onClick = onCancelMeasure,
+                                modifier = Modifier.testTag("settings_remeasure_cancel"),
+                            ) {
+                                Text("停止")
+                            }
+                        }
+                        LinearProgressIndicator(
+                            progress = {
+                                measureProgress.done.toFloat() /
+                                    measureProgress.total.coerceAtLeast(1)
+                            },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(4.dp),
+                        )
+                        measureProgress.current?.let { name ->
+                            Spacer(Modifier.height(8.dp))
+                            Text(
+                                text = "正在测「$name」",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                } else {
+                    FilledTonalButton(
+                        onClick = onRemeasureClick,
+                        enabled = stationCount > 0,
+                        modifier = Modifier.testTag("settings_remeasure_button"),
+                    ) {
+                        Text("重新测量")
+                    }
+                }
             }
         }
 
@@ -329,6 +409,9 @@ private fun SettingsCard(content: @Composable () -> Unit) {
         content = content,
     )
 }
+
+/** 每个台连流加测量按 12 秒估，向上取整到分钟 */
+private fun estimateMinutes(count: Int): Int = ((count * 12 + 59) / 60).coerceAtLeast(1)
 
 private fun bufferHint(seconds: Int): String = when {
     seconds <= 2 -> "出声最快，网络一抖就容易断"

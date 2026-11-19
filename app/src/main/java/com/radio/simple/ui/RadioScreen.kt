@@ -80,6 +80,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.radio.simple.R
 import com.radio.simple.data.RadioSettings
 import com.radio.simple.data.Station
+import com.radio.simple.playback.StationMeasureQueue
 
 /**
  * 系统文件选择器能选到的 M3U 类型。很多文件管理器给 .m3u 报的 MIME 各不相同，
@@ -106,6 +107,7 @@ private val SORT_ROW_SPACING = 10.dp
 fun RadioScreen(viewModel: PlayerViewModel = viewModel()) {
     val stations by viewModel.stations.collectAsStateWithLifecycle()
     val settings by viewModel.settings.collectAsStateWithLifecycle()
+    val measureProgress by viewModel.measureProgress.collectAsStateWithLifecycle()
 
     RequestRuntimePermissions()
 
@@ -117,6 +119,7 @@ fun RadioScreen(viewModel: PlayerViewModel = viewModel()) {
         isBuffering = viewModel.isBuffering,
         isImporting = viewModel.isImporting,
         isExporting = viewModel.isExporting,
+        measureProgress = measureProgress,
         quality = viewModel.audioQuality,
         // 传取值函数而不是数值：秒表每跳一次只让底部条自己重组，列表不用跟着刷
         elapsedMs = { viewModel.elapsedMs },
@@ -129,6 +132,8 @@ fun RadioScreen(viewModel: PlayerViewModel = viewModel()) {
         onPlayStop = viewModel::playOrStop,
         onBufferSecondsChange = viewModel::setBufferSeconds,
         onNormalizeVolumeChange = viewModel::setNormalizeVolume,
+        onRemeasure = viewModel::remeasureAll,
+        onCancelMeasure = viewModel::cancelRemeasure,
         onImportPlaylist = viewModel::importPlaylist,
         onExportPlaylist = viewModel::exportPlaylist,
         onReorder = viewModel::reorderStations,
@@ -148,6 +153,7 @@ fun RadioContent(
     isBuffering: Boolean,
     isImporting: Boolean,
     isExporting: Boolean,
+    measureProgress: StationMeasureQueue.Progress,
     quality: String?,
     elapsedMs: () -> Long,
     message: String?,
@@ -159,6 +165,8 @@ fun RadioContent(
     onPlayStop: () -> Unit,
     onBufferSecondsChange: (Int) -> Unit,
     onNormalizeVolumeChange: (Boolean) -> Unit,
+    onRemeasure: () -> Unit,
+    onCancelMeasure: () -> Unit,
     onImportPlaylist: (Uri) -> Unit,
     onExportPlaylist: (Uri) -> Unit,
     onReorder: (orderedIds: List<String>) -> Unit,
@@ -314,9 +322,12 @@ fun RadioContent(
                     stationCount = stations.size,
                     isImporting = isImporting,
                     isExporting = isExporting,
+                    measureProgress = measureProgress,
                     onAddClick = { showAddDialog = true },
                     onBufferSecondsChange = onBufferSecondsChange,
                     onNormalizeVolumeChange = onNormalizeVolumeChange,
+                    onRemeasureClick = onRemeasure,
+                    onCancelMeasure = onCancelMeasure,
                     onImportClick = pickPlaylist,
                     onExportClick = savePlaylist,
                     modifier = contentModifier,

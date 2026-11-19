@@ -237,4 +237,157 @@ class StationMeasureQueueTest {
 
         assertEquals("删掉的台不该还被拉流", listOf("a"), measured)
     }
+
+    // ------------------------------------------------------------------
+    // 手动重测：不看旧档案、不看「正在播」，还要能汇报进度
+    // ------------------------------------------------------------------
+
+    @Test
+    fun forceRemeasuresStationsThatAlreadyHaveAProfile() = runBlocking {
+        val measured = mutableListOf<String>()
+        val queue = StationMeasureQueue(
+            scope = this,
+            measure = { reading(-14f) },
+            onMeasured = { s, r -> measured += "${s.id}:${r.lufs}" },
+        )
+
+        // 已经有完整档案：普通排队会跳过
+        val known = station("a", lufs = -18f, peak = -6f)
+        queue.enqueue(listOf(known))
+        assertEquals("有档案就不该重测", 0, queue.remaining)
+
+        // 手动重测：旧读数必须被新读数覆盖
+        queue.enqueue(listOf(known), force = true)
+        queue.drain()
+
+        assertEquals(listOf("a:-14.0"), measured)
+    }
+
+    @Test
+    fun forceIgnoresSkipRuleSuchAsThePlayingStation() = runBlocking {
+        val measured = mutableListOf<String>()
+        val queue = StationMeasureQueue(
+            scope = this,
+            measure = { reading() },
+            onMeasured = { s, _ -> measured += s.id },
+            // 模拟「这个台正在播，别重复拉流」的规则
+            shouldSkip = { true },
+        )
+
+        queue.enqueue(listOf(station("a")))
+        queue.drain()
+        assertEquals("普通排队时该跳过", emptyList<String>(), measured)
+
+        queue.enqueue(listOf(station("a")), force = true)
+        queue.drain()
+        assertEquals("手动重测要连正在播的台一起测", listOf("a"), measured)
+    }
+
+    @Test
+    fun forceWorksEvenWhenNormalizationIsOff() = runBlocking {
+        // 用户关着自动音量也可能想先测一遍看看；测完不生效，但数据要存下来
+        val measured = mutableListOf<String>()
+        val queue = StationMeasureQueue(
+            scope = this,
+            measure = { reading() },
+            onMeasured = { s, _ -> measured += s.id },
+            enabled = { false },
+        )
+
+        queue.enqueue(listOf(station("a")), force = true)
+        queue.drain()
+
+        assertEquals(listOf("a"), measured)
+    }
+
+    @Test
+    fun progressReportsDoneAndTotal() = runBlocking {
+        val finished = mutableListOf<StationMeasureQueue.Progress>()
+        val queue = StationMeasureQueue(
+            scope = this,
+            measure = { delay(10); reading() },
+            onMeasured = { _, _ -> },
+            onFinished = { finished += it },
+        )
+
+        queue.enqueue(listOf(station("a"), station("b"), station("c")))
+        queue.drain()
+
+        val p = queue.progress.value
+        assertEquals("跑完不该还显示在跑", false, p.running)
+        assertEquals(3, p.done)
+        assertEquals(3, p.total)
+        assertEquals(0, p.failed)
+        assertEquals("完成时要汇报一次", 3, finished.single().done)
+    }
+
+    @Test
+    fun progressCountsFailuresWithoutStalling() = runBlocking {
+        val queue = StationMeasureQueue(
+            scope = this,
+            measure = { s -> if (s.id == "b") null else reading() },
+            onMeasured = { _, _ -> },
+        )
+
+        queue.enqueue(listOf(station("a"), station("b"), station("c")))
+        queue.drain()
+
+        val p = queue.progress.value
+        assertEquals("失败也要往前走", 3, p.done)
+        assertEquals(1, p.failed)
+    }
+
+    @Test
+    fun progressShrinksWhenAStationGetsSkipped() = runBlocking {
+        // 排进去之后这个台开始播了 -> 交给播放链路测，进度条不能永远差一格
+        var playing: String? = null
+        val queue = StationMeasureQueue(
+            scope = this,
+            measure = { delay(20); reading() },
+            onMeasured = { _, _ -> },
+            shouldSkip = { it.id == playing },
+        )
+
+        playing = "b"
+        queue.enqueue(listOf(station("a"), station("b")))
+        queue.drain()
+
+        val p = queue.progress.value
+        assertEquals("只测了 a 这一个", 1, p.done)
+        assertEquals("跳过的那个要从总数里扣掉，否则进度条永远差一格", 1, p.total)
+    }
+
+    @Test
+    fun cancelResetsProgressAndStopsTouchingTheNetwork() = runBlocking {
+        val measured = mutableListOf<String>()
+        val queue = StationMeasureQueue(
+            scope = this,
+            measure = { s -> delay(200); measured += s.id; reading() },
+            onMeasured = { _, _ -> },
+        )
+
+        queue.enqueue(listOf(station("a"), station("b"), station("c")))
+        delay(30)
+        queue.cancel()
+
+        assertEquals(0, queue.remaining)
+        assertEquals(false, queue.progress.value.running)
+        assertEquals(0, queue.progress.value.total)
+    }
+
+    @Test
+    fun enqueueingTheSameStationTwiceWhileRunningMeasuresItOnce() = runBlocking {
+        val measured = mutableListOf<String>()
+        val queue = StationMeasureQueue(
+            scope = this,
+            measure = { s -> delay(50); measured += s.id; reading() },
+            onMeasured = { _, _ -> },
+        )
+
+        queue.enqueue(listOf(station("a"), station("b")))
+        queue.enqueue(listOf(station("a"), station("b")), force = true)
+        queue.drain()
+
+        assertEquals("重复点按钮不该把同一条流测两遍", listOf("a", "b"), measured)
+    }
 }
