@@ -115,6 +115,23 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 > `gradle/wrapper/gradle-wrapper.properties` 里的下载地址换成了腾讯云镜像，国内同步快很多。海外环境可以改回 `https://services.gradle.org/distributions/`。
 
+**自动构建（GitHub Actions）**
+
+仓库带了 `.github/workflows/android.yml`，不需要任何配置就能跑：
+
+- **触发**：push 到 `main` / `master`、发起 PR，或在 Actions 页面手动 `Run workflow`
+- **做什么**：Ubuntu + JDK 17 + Android SDK 37，执行 `./gradlew assembleDebug`
+- **拿产物**：Actions → 某次运行 → 页面底部 **Artifacts** → `radio-debug-<构建号>.zip`，里面是 `app-debug.apk`，保留 14 天
+
+几个细节：
+
+- **不需要 secret**：debug 包由 runner 本地生成的调试证书签名，装上就能用
+- **有缓存**：Gradle 依赖和 wrapper 都走 `gradle/actions/setup-gradle` 的缓存，首次约 5 分钟，之后 1–2 分钟
+- **会自动取消**：同一分支连续 push，前一次还在跑的构建直接取消，不浪费额度
+- **只构建 debug**：release 包涉及签名私钥，不适合放在公开仓库的 CI 里，仍在本地发（见下节）
+
+> 默认不跑单元测试。想在 CI 里一起跑，把构建命令换成 `./gradlew assembleDebug testDebugUnitTest`（Robolectric 用例较重，构建时间会翻倍）。
+
 **关于签名。** 这个工程的 `release` 用的是 **debug 证书**（见 `app/build.gradle.kts`），目的是让 release 包和之前装的包同签名、能直接覆盖升级。如果你要自己发布，请换成正式 keystore：
 
 ```kotlin
@@ -142,6 +159,9 @@ buildTypes { getByName("release") { signingConfig = signingConfigs.getByName("re
 ## 代码结构
 
 ```
+.github/workflows/android.yml   CI：push / PR 自动构建 debug APK
+docs/images/                    README 用的截图
+
 app/src/main/java/com/radio/simple/
 ├── MainActivity.kt                 入口，套主题
 ├── data/
