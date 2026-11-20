@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  图标背景：左上偏紫、右下偏青的对角渐变，再叠一层很淡的高光，
+  比纯色更有质感，同时不抢前景的白色信号符号。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- 主渐变 -->
+    <path android:pathData="M0,0 H108 V108 H0 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:type="linear"
+                android:startX="6"
+                android:startY="0"
+                android:endX="102"
+                android:endY="108">
+                <item android:offset="0" android:color="#FF6A3DF5" />
+                <item android:offset="0.55" android:color="#FF2F62F0" />
+                <item android:offset="1" android:color="#FF0FB4DC" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- 左上高光，做一个很轻的球面感 -->
+    <path android:pathData="M0,0 H108 V108 H0 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:type="radial"
+                android:centerX="30"
+                android:centerY="24"
+                android:gradientRadius="72">
+                <item android:offset="0" android:color="#33FFFFFF" />
+                <item android:offset="0.5" android:color="#0CFFFFFF" />
+                <item android:offset="1" android:color="#00FFFFFF" />
+            </gradient>
+        </aapt:attr>
+    </path>
+</vector>
