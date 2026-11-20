@@ -1,9 +1,13 @@
 package com.radio.simple.ui
 
 import android.Manifest
+import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import android.os.PowerManager
+import android.provider.Settings
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -50,6 +54,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -75,6 +80,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.radio.simple.R
@@ -120,6 +128,8 @@ fun RadioScreen(viewModel: PlayerViewModel = viewModel()) {
         isImporting = viewModel.isImporting,
         isExporting = viewModel.isExporting,
         measureProgress = measureProgress,
+        // 每次重组现算：电台档案变了（新台测完、重测完）要跟着更新
+        measuredTargetLufs = viewModel.baseTargetLufs(),
         quality = viewModel.audioQuality,
         // 传取值函数而不是数值：秒表每跳一次只让底部条自己重组，列表不用跟着刷
         elapsedMs = { viewModel.elapsedMs },
@@ -132,6 +142,7 @@ fun RadioScreen(viewModel: PlayerViewModel = viewModel()) {
         onPlayStop = viewModel::playOrStop,
         onBufferSecondsChange = viewModel::setBufferSeconds,
         onNormalizeVolumeChange = viewModel::setNormalizeVolume,
+        onVolumeOffsetChange = viewModel::setVolumeOffset,
         onRemeasure = viewModel::remeasureAll,
         onCancelMeasure = viewModel::cancelRemeasure,
         onImportPlaylist = viewModel::importPlaylist,
@@ -154,6 +165,7 @@ fun RadioContent(
     isImporting: Boolean,
     isExporting: Boolean,
     measureProgress: StationMeasureQueue.Progress,
+    measuredTargetLufs: Float?,
     quality: String?,
     elapsedMs: () -> Long,
     message: String?,
@@ -165,6 +177,7 @@ fun RadioContent(
     onPlayStop: () -> Unit,
     onBufferSecondsChange: (Int) -> Unit,
     onNormalizeVolumeChange: (Boolean) -> Unit,
+    onVolumeOffsetChange: (Float) -> Unit,
     onRemeasure: () -> Unit,
     onCancelMeasure: () -> Unit,
     onImportPlaylist: (Uri) -> Unit,
@@ -172,6 +185,20 @@ fun RadioContent(
     onReorder: (orderedIds: List<String>) -> Unit,
 ) {
     val snackbarHostState = remember { SnackbarHostState() }
+
+    // 电池优化名单：用户去系统设置改完之后回来要刷新，所以挂在 ON_RESUME 上
+    val context = LocalContext.current
+    var batteryOptimized by remember { mutableStateOf(isBatteryOptimized(context)) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                batteryOptimized = isBatteryOptimized(context)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
 
     // 提到 when 外面：从设置页返回、进出排序模式时滚动位置都还在
     val listState = rememberLazyListState()
@@ -323,13 +350,17 @@ fun RadioContent(
                     isImporting = isImporting,
                     isExporting = isExporting,
                     measureProgress = measureProgress,
+                    measuredTargetLufs = measuredTargetLufs,
                     onAddClick = { showAddDialog = true },
                     onBufferSecondsChange = onBufferSecondsChange,
                     onNormalizeVolumeChange = onNormalizeVolumeChange,
+                    onVolumeOffsetChange = onVolumeOffsetChange,
                     onRemeasureClick = onRemeasure,
                     onCancelMeasure = onCancelMeasure,
                     onImportClick = pickPlaylist,
                     onExportClick = savePlaylist,
+                    batteryOptimized = batteryOptimized,
+                    onBatterySettingsClick = { requestIgnoreBatteryOptimization(context) },
                     modifier = contentModifier,
                 )
 
@@ -661,8 +692,8 @@ private fun StationRow(
                 )
 
                 isCurrent && isPlaying -> Icon(
-                    imageVector = PauseIcon,
-                    contentDescription = "暂停",
+                    imageVector = StopIcon,
+                    contentDescription = "停止",
                     modifier = Modifier.size(22.dp),
                 )
 
@@ -866,6 +897,26 @@ private fun defaultExportFileName(): String {
  * 通知权限（Android 13+）和局域网权限（Android 17+）各要一次。
  * 局域网权限是给放在家里 / 公司内网里的自建流媒体用的。
  */
+/** true = 还在电池优化名单里，息屏后可能被厂商省电策略冻结 */
+private fun isBatteryOptimized(context: Context): Boolean {
+    val powerManager = context.getSystemService(PowerManager::class.java) ?: return false
+    return !powerManager.isIgnoringBatteryOptimizations(context.packageName)
+}
+
+private fun requestIgnoreBatteryOptimization(context: Context) {
+    // 标准入口：直接弹「是否允许后台运行」的对话框
+    val direct = Intent(
+        Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+        Uri.parse("package:${context.packageName}"),
+    )
+    if (runCatching { context.startActivity(direct) }.isSuccess) return
+
+    // 有些 ROM 不认上面那个 action，退到电池优化列表，让用户自己找
+    runCatching {
+        context.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+    }
+}
+
 @Composable
 private fun RequestRuntimePermissions() {
     val context = LocalContext.current

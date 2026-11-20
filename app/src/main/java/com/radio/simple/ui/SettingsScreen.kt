@@ -36,6 +36,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.radio.simple.data.RadioSettings
 import com.radio.simple.playback.StationMeasureQueue
+import java.util.Locale
+import kotlin.math.abs
 import kotlin.math.roundToInt
 
 /**
@@ -48,13 +50,19 @@ fun SettingsPane(
     isImporting: Boolean,
     isExporting: Boolean,
     measureProgress: StationMeasureQueue.Progress,
+    /** 测算出的基准电平（不含用户偏移）；还没测出来是 null */
+    measuredTargetLufs: Float?,
     onAddClick: () -> Unit,
     onBufferSecondsChange: (Int) -> Unit,
     onNormalizeVolumeChange: (Boolean) -> Unit,
+    onVolumeOffsetChange: (Float) -> Unit,
     onRemeasureClick: () -> Unit,
     onCancelMeasure: () -> Unit,
     onImportClick: () -> Unit,
     onExportClick: () -> Unit,
+    /** 是否还在系统的电池优化名单里（true = 还没放行） */
+    batteryOptimized: Boolean,
+    onBatterySettingsClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     // 拖动时先动本地值，松手才落盘，避免每一帧都写一次 SharedPreferences
@@ -62,6 +70,11 @@ fun SettingsPane(
         mutableFloatStateOf(settings.bufferSeconds.toFloat())
     }
     val shownSeconds = sliderValue.roundToInt()
+
+    // 整体音量偏移：同样本地先行，值变了才往上报
+    var offsetValue by remember(settings.volumeOffsetDb) {
+        mutableFloatStateOf(settings.volumeOffsetDb)
+    }
 
     Column(
         modifier = modifier
@@ -195,6 +208,91 @@ fun SettingsPane(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
 
+                if (settings.normalizeVolume) {
+                    Spacer(Modifier.height(18.dp))
+
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            text = "整体音量",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            modifier = Modifier.weight(1f),
+                        )
+                        Text(
+                            text = offsetLabel(offsetValue),
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier
+                                .padding(start = 12.dp)
+                                .testTag("settings_volume_offset_value"),
+                        )
+                    }
+                    Spacer(Modifier.height(2.dp))
+                    // 说明单独占整行：和右侧数值挤在一行会被压成「…对齐」孤零零一个字
+                    Text(
+                        text = offsetHint(measuredTargetLufs, offsetValue),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+
+                    Slider(
+                        value = offsetValue,
+                        onValueChange = { raw ->
+                            // 吸附到 0.5 dB：手感是一格一格，不会停在 2.37 dB 这种数
+                            val step = RadioSettings.VOLUME_OFFSET_STEP_DB
+                            val snapped = (raw / step).roundToInt() * step
+                            val clamped = snapped.coerceIn(
+                                RadioSettings.MIN_VOLUME_OFFSET_DB,
+                                RadioSettings.MAX_VOLUME_OFFSET_DB,
+                            )
+                            if (clamped != offsetValue) {
+                                offsetValue = clamped
+                                // 实时生效：正在播的台立刻跟着变，边听边调
+                                onVolumeOffsetChange(clamped)
+                            }
+                        },
+                        valueRange = RadioSettings.MIN_VOLUME_OFFSET_DB..
+                            RadioSettings.MAX_VOLUME_OFFSET_DB,
+                        // 不画刻度点：40 个点排成一排太花；值本身还是吸附到 0.5 dB
+                        steps = 0,
+                        enabled = measuredTargetLufs != null,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 4.dp)
+                            .testTag("settings_volume_offset_slider"),
+                    )
+
+                    Row(modifier = Modifier.fillMaxWidth()) {
+                        Text(
+                            text = "轻 10 dB",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Spacer(Modifier.weight(1f))
+                        Text(
+                            text = "默认",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Spacer(Modifier.weight(1f))
+                        Text(
+                            text = "响 10 dB",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        text = "各台的相对音量不变，只把整体一起调。抬得太多时，" +
+                            "本来就贴顶的台会被峰值余量挡住，听着可能跟不上。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+
                 HorizontalDivider(
                     modifier = Modifier.padding(vertical = 18.dp),
                     color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f),
@@ -267,6 +365,43 @@ fun SettingsPane(
                     ) {
                         Text("重新测量")
                     }
+                }
+            }
+        }
+
+        SectionLabel("后台播放")
+
+        SettingsCard {
+            Column(modifier = Modifier.padding(20.dp)) {
+                Text(
+                    text = "后台播放保护",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    text = if (batteryOptimized) {
+                        "还没有加入电池优化白名单。息屏后厂商的省电策略可能把进程冻结，" +
+                            "表现为听几分钟就自己停了。加入白名单后配合前台播放服务，" +
+                            "锁屏也能一直听。"
+                    } else {
+                        "已加入电池优化白名单，锁屏后不会再被系统冻结。" +
+                            "部分手机（小米、OPPO、vivo 等）还需要在系统设置里允许" +
+                            "「自启动」和「后台运行」，那个开关第三方应用改不了。"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+
+                Spacer(Modifier.height(16.dp))
+
+                FilledTonalButton(
+                    onClick = onBatterySettingsClick,
+                    enabled = batteryOptimized,
+                    modifier = Modifier.testTag("settings_battery_button"),
+                ) {
+                    Text(if (batteryOptimized) "加入白名单" else "已允许后台运行")
                 }
             }
         }
@@ -412,6 +547,30 @@ private fun SettingsCard(content: @Composable () -> Unit) {
 
 /** 每个台连流加测量按 12 秒估，向上取整到分钟 */
 private fun estimateMinutes(count: Int): Int = ((count * 12 + 59) / 60).coerceAtLeast(1)
+
+/** 右侧的偏移读数：0 显示「默认」，其余带正负号，负号用真正的减号 */
+private fun offsetLabel(db: Float): String = when {
+    abs(db) < 0.01f -> "默认"
+    else -> String.format(Locale.US, "%+.1f dB", db).replace('-', '\u2212')
+}
+
+/**
+ * 说明文字要回答两件事：测出来的平均电平是多少、现在实际对齐到哪。
+ *
+ * 只显示偏移量不够——用户不知道「+3 dB」是从哪加起来的；
+ * 只显示目标也不够——他不知道自己动了多少。两个都给。
+ */
+private fun offsetHint(measured: Float?, offsetDb: Float): String {
+    if (measured == null) {
+        return "还没有测出平均电平，播放或重新测量之后才能整体调节"
+    }
+    val base = String.format(Locale.US, "%.1f", measured).replace('-', '\u2212')
+    if (abs(offsetDb) < 0.01f) {
+        return "测算出的平均电平 $base LUFS，所有台都朝它对齐"
+    }
+    val now = String.format(Locale.US, "%.1f", measured + offsetDb).replace('-', '\u2212')
+    return "测算出的平均电平 $base LUFS，现在按 $now LUFS 对齐"
+}
 
 private fun bufferHint(seconds: Int): String = when {
     seconds <= 2 -> "出声最快，网络一抖就容易断"

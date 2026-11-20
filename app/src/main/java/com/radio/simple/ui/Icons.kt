@@ -53,29 +53,6 @@ internal val PlayIcon: ImageVector by lazy {
     }.build()
 }
 
-internal val PauseIcon: ImageVector by lazy {
-    ImageVector.Builder(
-        name = "Pause",
-        defaultWidth = 24.dp,
-        defaultHeight = 24.dp,
-        viewportWidth = 24f,
-        viewportHeight = 24f,
-    ).apply {
-        path(fill = SolidColor(Color.Black)) {
-            moveTo(6.5f, 4.8f)
-            horizontalLineTo(9.8f)
-            verticalLineTo(19.2f)
-            horizontalLineTo(6.5f)
-            close()
-            moveTo(14.2f, 4.8f)
-            horizontalLineTo(17.5f)
-            verticalLineTo(19.2f)
-            horizontalLineTo(14.2f)
-            close()
-        }
-    }.build()
-}
-
 /**
  * 设置用「滑杆」造型，比齿轮好画，也更像调参数。
  */

@@ -45,6 +45,9 @@ object VolumeLevel {
     /** 冷启动读数从第几秒开始可用。至少 3 个 block，避免被半个字 / 一段静音带偏 */
     const val EARLY_SECONDS = 2.4f
 
+    /** 用户手动整体加减的幅度上限（dB）。和设置页滑块的范围一致 */
+    const val MAX_OFFSET_DB = 10f
+
     /**
      * 给削波留的天花板（dBFS）。
      *
@@ -72,6 +75,20 @@ object VolumeLevel {
         }
         return median.coerceIn(MIN_TARGET_LUFS, MAX_TARGET_LUFS)
     }
+
+    /**
+     * 把用户拖的整体偏移叠到目标电平上。
+     *
+     * 这里**不再**夹 [MIN_TARGET_LUFS] / [MAX_TARGET_LUFS]：那两个值约束的是
+     * 「自动算出来的目标」，让整套电台不至于被极值拖走；而用户手动拖的意思恰恰是
+     * 「我要比这个再响 / 再轻一点」，夹回去就等于拖了没反应。
+     * 单台的最终增益仍受 [MAX_ATTENUATION_DB] / [MAX_BOOST_DB] 和峰值余量约束，
+     * 所以这里放开是安全的。
+     *
+     * @return 叠加后的目标；基准为 null（还没测出任何电平）时返回 null
+     */
+    fun offsetTarget(target: Float?, offsetDb: Float): Float? =
+        target?.plus(offsetDb.coerceIn(-MAX_OFFSET_DB, MAX_OFFSET_DB))
 
     /**
      * 某个台相对目标电平需要多少 dB 的增益。可正可负。

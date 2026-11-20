@@ -261,4 +261,73 @@ class VolumeLevelTest {
         val anchor = VolumeLevel.anchor(listOf(-19f, null))!!
         assertEquals(-8f, VolumeLevel.earlyGainDb(-11f, -3f, anchor), 0.001f)
     }
+
+    // ------------------------------------------------------------------
+    // 用户手动整体加减
+    // ------------------------------------------------------------------
+
+    @Test
+    fun offsetShiftsTheTargetUpAndDown() {
+        val base = VolumeLevel.target(listOf(-9f, -18f, -26f))!!
+        assertEquals(-18f, base, 0.01f)
+        assertEquals(-15f, VolumeLevel.offsetTarget(base, 3f)!!, 0.01f)
+        assertEquals(-21f, VolumeLevel.offsetTarget(base, -3f)!!, 0.01f)
+        assertEquals("0 dB 就是不动", -18f, VolumeLevel.offsetTarget(base, 0f)!!, 0.01f)
+    }
+
+    @Test
+    fun offsetIsClampedToTheSliderRange() {
+        // 设置页最多 ±10 dB；即使有人传了更大的值也不能失控
+        // 基准 −18 加满 +10 就是 −8，减满 −10 就是 −28
+        assertEquals(-8f, VolumeLevel.offsetTarget(-18f, 99f)!!, 0.01f)
+        assertEquals(-28f, VolumeLevel.offsetTarget(-18f, -99f)!!, 0.01f)
+        assertEquals(VolumeLevel.MAX_OFFSET_DB, 10f, 0.01f)
+    }
+
+    @Test
+    fun offsetDoesNothingWithoutABaseline() {
+        assertNull("还没测出电平，拖了也没依据", VolumeLevel.offsetTarget(null, 3f))
+    }
+
+    @Test
+    fun offsetMovesEveryStationTogether() {
+        // 这是这个功能的核心：台与台的相对关系不能变
+        // 峰值留足余量（−20），这样每台都不受天花板限制，能看清「整体平移」
+        val all = listOf(-11f, -18f, -25f)
+        val before = all.map { VolumeLevel.gainDb(it, -20f, VolumeLevel.offsetTarget(-18f, 0f)) }
+        val after = all.map { VolumeLevel.gainDb(it, -20f, VolumeLevel.offsetTarget(-18f, 3f)) }
+
+        before.zip(after).forEach { (b, a) ->
+            assertEquals("每台都该正好多 3dB", b + 3f, a, 0.001f)
+        }
+    }
+
+    @Test
+    fun offsetUpIsStillLimitedByPeakHeadroom() {
+        // 目标抬到 −15，但这个台峰值已经 −4：理论上抬 3dB，实际只剩 1dB 空间
+        val target = VolumeLevel.offsetTarget(-18f, 3f)!!
+        assertEquals(1f, VolumeLevel.gainDb(-18f, -4f, target), 0.01f)
+    }
+
+    @Test
+    fun offsetDownIsStillLimitedByMaxAttenuation() {
+        // 目标压到 −28，对 −13 的响台要压 15dB —— 正好是封顶值，再多就听不见了
+        val target = VolumeLevel.offsetTarget(-18f, -10f)!!
+        assertEquals(
+            VolumeLevel.MAX_ATTENUATION_DB,
+            VolumeLevel.gainDb(-13f, -3f, target),
+            0.01f,
+        )
+    }
+
+    @Test
+    fun offsetUpIsStillLimitedByMaxBoost() {
+        // 目标抬到 −8，对 −30 的轻台要抬 22dB，只能给到 12dB
+        val target = VolumeLevel.offsetTarget(-18f, 10f)!!
+        assertEquals(
+            VolumeLevel.MAX_BOOST_DB,
+            VolumeLevel.gainDb(-30f, -20f, target),
+            0.01f,
+        )
+    }
 }

@@ -5,7 +5,9 @@ import android.util.Log
 import androidx.annotation.OptIn
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
+import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
+import androidx.media3.common.Timeline
 import androidx.media3.common.audio.AudioProcessor
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DataSource
@@ -18,7 +20,6 @@ import androidx.media3.exoplayer.audio.AudioSink
 import androidx.media3.exoplayer.audio.DefaultAudioSink
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.source.MediaSource
-import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
 
 /**
  * 进程内唯一的播放器，界面和服务共用同一个实例。
@@ -33,9 +34,6 @@ object PlaybackEngine {
 
     private const val TAG = "PlaybackEngine"
 
-    /** 网络失败重试次数 */
-    private const val RETRY_COUNT = 3
-
     /**
      * 用浏览器 UA：部分电台 CDN 会按 UA 拦掉「非浏览器」的请求。
      */
@@ -47,6 +45,34 @@ object PlaybackEngine {
     private var activeBufferSeconds: Int = -1
     private var currentReleased: Boolean = false
     private val swapListeners = mutableListOf<(ExoPlayer) -> Unit>()
+
+    /**
+     * 收听时长跟着**播放器**走，不跟界面走。
+     *
+     * 界面（ViewModel）会被返回键销毁，但播放和服务还在；如果计时挂在界面上，
+     * 一是重建后归零，二是界面销毁期间从通知栏暂停会继续虚增。挂在这里两头都对。
+     * [PlayedTime] 的 start / pause 是幂等的，界面那边重复调用也无妨。
+     */
+    private val playedTimeListener = object : Player.Listener {
+        override fun onIsPlayingChanged(isPlaying: Boolean) {
+            if (isPlaying) PlayedTime.start() else PlayedTime.pause()
+        }
+
+        override fun onTimelineChanged(timeline: Timeline, reason: Int) {
+            // 服务里的停止会先 stop 再 clearMediaItems，state 可能早就是 IDLE 了，
+            // 光等 onPlaybackStateChanged 会漏掉这一下
+            if (exoPlayer?.mediaItemCount == 0) PlayedTime.reset()
+        }
+
+        override fun onPlaybackStateChanged(playbackState: Int) {
+            // 只有「连媒体项都清空了」才算真的停止（服务里的停止按钮会 clearMediaItems）。
+            // 重新装载 / 换缓冲档位都会短暂回到 IDLE，那些情况时长得留着，
+            // 否则会从 00:00 重来。
+            if (playbackState == Player.STATE_IDLE && exoPlayer?.mediaItemCount == 0) {
+                PlayedTime.reset()
+            }
+        }
+    }
 
     /** 跟当前播放器绑定的响度计。播放器重建时会换一个新的 */
     private var loudnessMeter: LoudnessMeter? = null
@@ -93,6 +119,41 @@ object PlaybackEngine {
     fun current(): ExoPlayer? = if (currentReleased) null else exoPlayer
 
     /**
+     * 起播（列表行尾、底部播放键、通知栏、自动重连都走这里）。
+     *
+     * **一律重新装载媒体项**，不区分是刚停止、暂停了一会儿还是上次出错：
+     * 直播的缓冲是「按下停止那一刻的节目」，接着放只会先出声几秒、断掉、再回源，
+     * 内容还接不上。重新 `setMediaItem` 会让 HLS 重新取一遍 playlist，从当前
+     * 直播位置开始；代价只是多等一次起播缓冲。
+     *
+     * 不带位置参数很关键：`0` 对直播来说是窗口最开头（最旧的切片），不是最新位置。
+     */
+    fun resumeFromPause() {
+        val p = current() ?: return
+        val item = p.currentMediaItem
+        if (item == null) {
+            // 连电台都没有，没什么可装载的
+            p.play()
+            return
+        }
+        Log.i(TAG, "起播：重新拉流，从当前直播位置开始")
+        p.setMediaItem(item)
+        p.prepare()
+        p.play()
+    }
+
+    /**
+     * 停播并把这次的收听时长清零。
+     *
+     * 语音输入抢占麦克风时用：播放器只是 stop（媒体项还留着），
+     * 而「停止」在用户看来就是这次收听结束了，时长不该挂在那儿。
+     */
+    fun stopAndReset() {
+        current()?.stop()
+        PlayedTime.reset()
+    }
+
+    /**
      * 当前播放器挂着的响度计。换台后要 [LoudnessMeter.startOver]，
      * 已经测完的台则直接读 [LoudnessMeter.reading] 的结果。
      */
@@ -116,6 +177,7 @@ object PlaybackEngine {
         gainProcessor = null
         activeBufferSeconds = -1
         currentReleased = true
+        PlayedTime.reset()
         runCatching { existing?.release() }
     }
 
@@ -161,7 +223,12 @@ object PlaybackEngine {
                 /* handleAudioFocus = */ true
             )
             .setHandleAudioBecomingNoisy(true)
+            // 息屏后也要继续播：默认 WAKE_MODE_NONE 不持有任何唤醒锁，
+            // 屏幕一关、设备睡着，网络就断了 —— 用户听到的就是「播着播着停了」。
+            // 这个模式只在播放期间持有，暂停 / 停止会自动释放。
+            .setWakeMode(C.WAKE_MODE_NETWORK)
             .build()
+            .also { it.addListener(playedTimeListener) }
     }
 
     /**
@@ -193,8 +260,8 @@ object PlaybackEngine {
      */
     internal fun mediaSourceFactory(context: Context): MediaSource.Factory =
         DefaultMediaSourceFactory(dataSourceFactory(context))
-            // 网络抖动时多试几次，直播流不要一失败就报错
-            .setLoadErrorHandlingPolicy(DefaultLoadErrorHandlingPolicy(RETRY_COUNT))
+            // 直播流对短时断网要宽容：默认只重试 3 次、3 秒就放弃
+            .setLoadErrorHandlingPolicy(RadioLoadErrorPolicy())
 
     /**
      * 网络层：不少电台 CDN 会挑 UA、会把 http 重定向到 https（跨协议），

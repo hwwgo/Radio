@@ -5,7 +5,6 @@ import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.net.Uri
-import android.os.SystemClock
 import android.util.Log
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -31,6 +30,8 @@ import com.radio.simple.playback.LoudnessProbe
 import com.radio.simple.playback.LoudnessReading
 import com.radio.simple.playback.PlaybackEngine
 import com.radio.simple.playback.PlaybackService
+import com.radio.simple.playback.PlayedTime
+import com.radio.simple.playback.RadioLoadErrorPolicy
 import com.radio.simple.playback.StationMeasureQueue
 import com.radio.simple.playback.VolumeLevel
 import com.radio.simple.playback.streamMimeType
@@ -99,6 +100,12 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
     /** 用户点了「重新测量所有电台」，队列跑完后要汇报结果 */
     private var remeasureRequested = false
 
+    /** 断流后的自动重连。null 表示当前没有在等重连 */
+    private var reconnectJob: Job? = null
+
+    /** 这次收听已经重连过几次。真的出声后清零 */
+    private var reconnectAttempts = 0
+
     /**
      * 新电台的预听队列。
      *
@@ -146,14 +153,27 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
     private val playerListener = object : Player.Listener {
         override fun onIsPlayingChanged(playing: Boolean) {
             isPlaying = playing
-            if (playing) isBuffering = false
+            if (playing) {
+                isBuffering = false
+                // 真的出声了才算恢复。只是 prepare 成功还不够 ——
+                // 有些源能连上但一直没数据，那时不该把次数清零
+                reconnectAttempts = 0
+            }
+            // 收听时长由 PlaybackEngine 的常驻监听维护（界面销毁也不会停），这里只读
         }
 
         override fun onPlaybackStateChanged(playbackState: Int) {
             isBuffering = playbackState == Player.STATE_BUFFERING
-            // 停止（包括语音输入自动停）要把计时清零，
-            // 否则底部条会因为「还有秒数」把它显示成「已暂停」
-            if (playbackState == Player.STATE_IDLE) elapsedMs = 0L
+            // 清零判断统一交给 PlaybackEngine（它知道是「真停止」还是「重新拉流」），
+            // 这里只把界面上的秒数同步成最新值
+            elapsedMs = PlayedTime.elapsedMs()
+            // 直播不该「播完」。清单里短暂出现 ENDLIST、或者窗口被服务端截断时，
+            // 播放器会走到 ENDED，界面就停在「已暂停」—— 这里重新拉一次
+            if (playbackState == Player.STATE_ENDED && isCurrentLive()) {
+                if (!scheduleReconnect("直播流结束了")) {
+                    message = "直播流已经断开，点一下播放重新连接"
+                }
+            }
         }
 
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
@@ -168,38 +188,123 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
 
         override fun onPlayerError(error: PlaybackException) {
             isBuffering = false
-            val scheme = requestedUrl?.substringBefore("://")?.lowercase()
-            message = when {
-                scheme == "mms" || scheme == "rtmp" ->
-                    "播放失败：MMS / RTMP 这类老式地址已经播不了，请换成 http(s) 的 .m3u8 或 mp3 直播地址"
+            val described = describeError(error)
 
-                error.errorCode == PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS ->
-                    "播放失败：服务器拒绝访问（403/404），链接可能过期或需要换 UA"
-
-                error.errorCode == PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND ->
-                    "播放失败：链接找不到（404）"
-
-                error.errorCode == PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED ||
-                    error.errorCode == PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT ->
-                    "播放失败：连不上这个地址，检查网络或链接"
-
-                error.errorCode == PlaybackException.ERROR_CODE_PARSING_MANIFEST_UNSUPPORTED ||
-                    error.errorCode == PlaybackException.ERROR_CODE_PARSING_MANIFEST_MALFORMED ->
-                    "播放失败：直播清单解析不了，这个链接可能已经失效"
-
-                error.errorCode == PlaybackException.ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED ||
-                    error.errorCode == PlaybackException.ERROR_CODE_PARSING_CONTAINER_MALFORMED ->
-                    "播放失败：拿到的不是音频流（可能是网页、错误页或加密流）"
-
-                else -> "播放失败（${error.errorCodeName}），检查一下链接是否正确"
+            // 403 / 404 这类是链接本身的问题，重连一百次也一样，别让用户干等
+            if (isPermanentFailure(error)) {
+                message = described
+                return
+            }
+            // 网络抖动、服务器瞬断：先自己接上，接不上再把错误告诉用户
+            if (!scheduleReconnect(described)) {
+                message = described
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // 断流恢复
+    // ------------------------------------------------------------------
+
+    /** 把播放错误翻译成用户看得懂的一句话 */
+    private fun describeError(error: PlaybackException): String {
+        val scheme = requestedUrl?.substringBefore("://")?.lowercase()
+        return when {
+            scheme == "mms" || scheme == "rtmp" ->
+                "播放失败：MMS / RTMP 这类老式地址已经播不了，请换成 http(s) 的 .m3u8 或 mp3 直播地址"
+
+            error.errorCode == PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS ->
+                "播放失败：服务器拒绝访问（403/404），链接可能过期或需要换 UA"
+
+            error.errorCode == PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND ->
+                "播放失败：链接找不到（404）"
+
+            error.errorCode == PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED ||
+                error.errorCode == PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT ->
+                "播放失败：连不上这个地址，检查网络或链接"
+
+            error.errorCode == PlaybackException.ERROR_CODE_PARSING_MANIFEST_UNSUPPORTED ||
+                error.errorCode == PlaybackException.ERROR_CODE_PARSING_MANIFEST_MALFORMED ->
+                "播放失败：直播清单解析不了，这个链接可能已经失效"
+
+            error.errorCode == PlaybackException.ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED ||
+                error.errorCode == PlaybackException.ERROR_CODE_PARSING_CONTAINER_MALFORMED ->
+                "播放失败：拿到的不是音频流（可能是网页、错误页或加密流）"
+
+            else -> "播放失败（${error.errorCodeName}），检查一下链接是否正确"
+        }
+    }
+
+    /**
+     * 4xx 里除了 408（超时）和 429（限流），都是「这个地址不行」，
+     * 重连只会让用户等更久。
+     */
+    private fun isPermanentFailure(error: PlaybackException): Boolean {
+        val code = RadioLoadErrorPolicy.responseCodeOf(error) ?: return false
+        return code in 400..499 && code != 408 && code != 429
+    }
+
+    /** 当前这个是不是直播。点播 m3u8 播完就该停，不能当成断流去重连 */
+    private fun isCurrentLive(): Boolean =
+        PlaybackEngine.current()?.isCurrentMediaItemLive == true
+
+    /**
+     * 断流后自动接上，返回 false 表示不再重试（次数用尽 / 用户已经不要听了）。
+     *
+     * 为什么不是只靠重试策略：[RadioLoadErrorPolicy] 重试的是**同一个分片**，
+     * 如果清单会话整体失效（CDN 换了节点、token 过期），重试多少次都没用。
+     * 重新 prepare 会重新拉一次清单，相当于换了个新会话 —— 这才是真正的恢复。
+     */
+    private fun scheduleReconnect(reason: String): Boolean {
+        val p = PlaybackEngine.current() ?: return false
+        val id = currentId ?: return false
+        // 用户已经暂停 / 停止：不要自己又响起来
+        if (!p.playWhenReady) return false
+        if (reconnectJob?.isActive == true) return true
+
+        val attempt = reconnectAttempts
+        if (attempt >= RECONNECT_DELAYS_MS.size) return false
+
+        reconnectAttempts = attempt + 1
+        isBuffering = true
+        // 只第一次提示；后面静默重试，免得连着弹三条
+        if (attempt == 0) message = "$reason，正在自动重连…"
+
+        val delayMs = RECONNECT_DELAYS_MS[attempt]
+        reconnectJob = viewModelScope.launch {
+            delay(delayMs)
+            val player = PlaybackEngine.current() ?: return@launch
+            // 等的时候用户切台 / 按了停止，就别再动
+            if (currentId != id) return@launch
+            if (!player.playWhenReady) return@launch
+
+            Log.i(TAG, "自动重连第 ${attempt + 1} 次（等了 ${delayMs}ms）")
+            // 和手动起播同一条路：重新装载，从当前直播位置开始；
+            // 只 prepare 会从出错前的位置续，那里往往已经过期了
+            runCatching {
+                PlaybackEngine.resumeFromPause()
+            }.onFailure { error ->
+                Log.w(TAG, "自动重连失败", error)
+                message = "重连失败：${error.message ?: "播放器没能重新启动"}"
+            }
+        }
+        return true
+    }
+
+    /** 主动播放 / 停止时清掉重连状态，别让旧任务把新操作搅乱 */
+    private fun cancelReconnect() {
+        reconnectJob?.cancel()
+        reconnectJob = null
+        reconnectAttempts = 0
     }
 
     /** 缓冲参数变了会换播放器，监听要跟着挪过去 */
     private val swapListener: (ExoPlayer) -> Unit = { fresh -> attach(fresh) }
 
     init {
+        // 先把进程级的收听时长接上：Activity 被返回键销毁后重新打开，
+        // 第一帧就该显示真实秒数，而不是闪一下 00:00
+        elapsedMs = PlayedTime.elapsedMs()
         attach(PlaybackEngine.player(getApplication(), settingsStore.current.bufferSeconds))
         PlaybackEngine.addSwapListener(swapListener)
         // 让 MediaSession 尽早起来，通知栏 / 灵动岛才有东西可挂
@@ -210,20 +315,18 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
     /**
      * 已播放时长。
      *
-     * 用 [SystemClock.elapsedRealtime] 累加而不是「当前时间 - 开始时间」：
-     * 直播流没有进度条，暂停 / 缓冲期间的时间不该算进去。
-     * 半秒一跳，秒数变化看起来才跟得上。
+     * 数值来自进程级的 [PlayedTime]，不是这里自己累加：按返回键会把 ViewModel 销毁，
+     * 而播放器和服务还在放，重建后的界面必须接着显示真实时长，而不是从 00:00 再来一遍。
+     * 半秒轮询一次，秒数变化看起来才跟得上。
      */
     private fun startStopwatch() {
         stopwatchJob?.cancel()
         stopwatchJob = viewModelScope.launch {
-            var last = SystemClock.elapsedRealtime()
             while (isActive) {
                 delay(500)
-                val now = SystemClock.elapsedRealtime()
-                val delta = now - last
-                last = now
-                if (isPlaying) elapsedMs += delta
+                // 读进程级的累计值，而不是自己累加：Activity 被返回键销毁后重建，
+                // 这里接上的仍然是同一个播放器的真实收听时长
+                elapsedMs = PlayedTime.elapsedMs()
             }
         }
     }
@@ -280,7 +383,11 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     /**
-     * 行尾按钮：当前电台就播放 / 暂停，不是当前电台就切过去播。
+     * 行尾按钮：当前电台就停止，不是当前电台就切过去播。
+     *
+     * 和底部播放键保持**完全一致**：播放中点了就是停止（断流、清缓冲、计时归零），
+     * 再点才是重新起播。直播没有「暂停续听」这回事 —— 暂停期间节目一直在走，
+     * 续播只能接旧内容，正是之前「响几秒、没声、内容还跳」的来源。
      */
     fun toggleStation(station: Station) {
         val p = player()
@@ -289,29 +396,27 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
             return
         }
         when {
-            p.playbackState == Player.STATE_IDLE -> {
-                startPlaybackService()
-                // 停止过再播，目标电平可能因为新增电台变了，重新套一次
-                PlaybackEngine.gain()?.setGain(gainFor(station))
-                p.prepare()
-                p.play()
-                beginLoudnessMeasurement(station, freshStart = false)
-            }
-
-            p.isPlaying || p.playbackState == Player.STATE_BUFFERING -> p.pause()
+            p.isPlaying || p.playbackState == Player.STATE_BUFFERING -> stopNow(p)
 
             else -> {
                 startPlaybackService()
-                p.play()
+                // 停止过再播，目标电平可能因为新增电台变了，重新套一次
+                if (p.playbackState == Player.STATE_IDLE) {
+                    PlaybackEngine.gain()?.setGain(gainFor(station))
+                    beginLoudnessMeasurement(station, freshStart = false)
+                }
+                PlaybackEngine.resumeFromPause()
             }
         }
     }
 
     private fun start(station: Station, p: ExoPlayer) {
+        cancelReconnect()
         currentId = station.id
         isBuffering = true
         requestedUrl = station.url
         // 换台就是一次新的收听：时长归零，音质等播放器解析出音轨再填
+        PlayedTime.reset()
         elapsedMs = 0L
         audioQuality = null
         startPlaybackService()
@@ -322,8 +427,9 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
             // 不会出现「先炸一下再变小」那种突兀感
             PlaybackEngine.gain()?.setGain(gainFor(station))
 
-            // 无条件重新装载：同一个电台再点一次（上次可能失败了）也要重来
-            p.setMediaItem(mediaItem(station), 0L)
+            // 无条件重新装载：同一个电台再点一次（上次可能失败了）也要重来。
+            // 不带位置参数：直播从默认位置（live edge）起播；写死 0 会退到窗口最开头
+            p.setMediaItem(mediaItem(station))
             p.prepare()
             p.play()
         } catch (e: Exception) {
@@ -355,21 +461,18 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         }
 
         when {
-            p.playbackState == Player.STATE_IDLE -> {
-                startPlaybackService()
-                stations.value.firstOrNull { it.id == currentId }?.let { station ->
-                    PlaybackEngine.gain()?.setGain(gainFor(station))
-                    beginLoudnessMeasurement(station, freshStart = false)
-                }
-                p.prepare()
-                p.play()
-            }
-
             p.isPlaying || p.playbackState == Player.STATE_BUFFERING -> stopNow(p)
 
             else -> {
                 startPlaybackService()
-                p.play()
+                if (p.playbackState == Player.STATE_IDLE) {
+                    stations.value.firstOrNull { it.id == currentId }?.let { station ->
+                        PlaybackEngine.gain()?.setGain(gainFor(station))
+                        beginLoudnessMeasurement(station, freshStart = false)
+                    }
+                }
+                // 与列表行尾按钮完全一致：停止过 / 暂停久了都重新回源
+                PlaybackEngine.resumeFromPause()
             }
         }
     }
@@ -431,11 +534,13 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
 
     /** 停止并清空：底部条上的时长回到 0，音质信息也一起清掉 */
     private fun stopNow(p: ExoPlayer) {
+        cancelReconnect()
         p.stop()
         resetPlayedInfo()
     }
 
     private fun resetPlayedInfo() {
+        PlayedTime.reset()
         elapsedMs = 0L
         audioQuality = null
     }
@@ -448,15 +553,26 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
     private fun allLoudness(): List<Float?> = stations.value.map { it.loudnessLufs }
 
     /**
-     * 目标电平：已测台的中位数；只有一个已测台时以它为参照。
+     * 测算出来的基准电平（中位数，只有一个已测台时用那台），**不含**用户偏移。
      *
-     * 第二种情况专门照顾「刚装好 / 刚加第二台」：这时候中位数算不出来，
-     * 但用户耳朵里已经有了「正常音量」的基准，新台朝它对齐是对的。
+     * 设置页拿它显示「测出来是多少」，用户也好判断该往哪边调。
      */
-    private fun targetLufs(): Float? {
+    fun baseTargetLufs(): Float? {
         val all = allLoudness()
         return VolumeLevel.target(all) ?: VolumeLevel.anchor(all)
     }
+
+    /**
+     * 实际对齐用的目标电平：基准 + 用户在设置里拖的整体偏移。
+     *
+     * 偏移加在目标上，而不是加在每台算完的增益上 —— 两者数学上等价，
+     * 但加在目标上能让「峰值余量」继续按同一个尺子算，不会出现
+     * 「用户往上拖 3dB，把某个已经贴顶的台顶破音」。
+     */
+    private fun targetLufs(): Float? = VolumeLevel.offsetTarget(
+        baseTargetLufs(),
+        settingsStore.current.volumeOffsetDb,
+    )
 
     private fun hasProfile(id: String): Boolean =
         stations.value.firstOrNull { it.id == id }?.let {
@@ -570,6 +686,17 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
     private fun applyGainForCurrent() {
         val id = PlaybackEngine.current()?.currentMediaItem?.mediaId ?: return
         applyGainFor(id)
+    }
+
+    /**
+     * 设置页的「整体音量」滑块：在测算出的基准电平上整体加减。
+     *
+     * 拖的时候每半档调一次，正在播的台立刻跟着变 —— 用户能一边听一边找位置，
+     * 不用「拖完、切回去、再听、再回来」。
+     */
+    fun setVolumeOffset(db: Float) {
+        settingsStore.setVolumeOffset(db)
+        applyGainForCurrent()
     }
 
     /** 设置页的「自动音量」开关 */
@@ -779,6 +906,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     override fun onCleared() {
+        cancelReconnect()
         stopwatchJob?.cancel()
         stopwatchJob = null
         measureJob?.cancel()
@@ -799,6 +927,9 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
 
         /** 主播放器在缓冲时最多等这么久，之后照测不误 */
         const val PROBE_WAIT_MS = 10_000L
+
+        /** 自动重连的等待时间：先快后慢，三次都接不上就把选择权交回用户 */
+        val RECONNECT_DELAYS_MS = longArrayOf(2_000, 6_000, 15_000)
 
         var cachedArtwork: ByteArray? = null
     }
