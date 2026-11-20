@@ -1,5 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<resources>
-    <string name="app_name">收音机</string>
-    <string name="notification_channel_name">电台播放</string>
-</resources>
